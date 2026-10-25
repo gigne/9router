@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getProviderConnectionById } from "@/models";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 import { GEMINI_CONFIG, ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
+import { GITHUB_COPILOT } from "open-sse/config/appConstants.js";
 import { refreshGoogleToken, refreshCodexToken, updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveOllamaLocalHost } from "open-sse/config/providers.js";
 import { getModelsByProviderId } from "open-sse/config/providerModels.js";
@@ -13,10 +14,43 @@ import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { resolveClineModels, resolveClinepassModels } from "open-sse/services/clinepassModels.js";
+import { resolveCopilotModels } from "open-sse/services/copilotModels.js";
 import { NOUS_MODELS_URL, normalizeNousModels } from "open-sse/services/nous.js";
 import codexProvider from "open-sse/providers/registry/codex.js";
+import { ANTIGRAVITY_IDE_BASE_URL, ANTIGRAVITY_IDE_USER_AGENT, ANTIGRAVITY_IDE_VERSION, ANTIGRAVITY_OAUTH_CLIENT } from "open-sse/providers/shared.js";
+import { getProjectIdForConnection } from "open-sse/services/projectId.js";
 
 const GEMINI_CLI_MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+
+// Copilot live catalog via the raw GitHub OAuth token (gu_/gho_). Some
+// accounts 402 on the exchanged copilot token while the raw token still
+// lists chat-capable models. Mirrors the chat path's headers.
+async function fetchGithubModelsWithRawToken(accessToken) {
+  try {
+    const response = await fetch("https://api.githubcopilot.com/models", {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Copilot-Integration-Id": "vscode-chat",
+        "editor-version": `vscode/${GITHUB_COPILOT.VSCODE_VERSION}`,
+        "editor-plugin-version": `copilot-chat/${GITHUB_COPILOT.COPILOT_CHAT_VERSION}`,
+        "user-agent": GITHUB_COPILOT.USER_AGENT,
+        "x-github-api-version": GITHUB_COPILOT.API_VERSION,
+      },
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return Array.isArray(data?.data)
+      ? data.data
+          .filter((m) => m.capabilities?.type === "chat" && !(m.policy && m.policy.state === "disabled"))
+          .map((m) => ({ id: m.id, name: m.name || m.id, version: m.version }))
+      : null;
+  } catch (error) {
+    console.log("Failed to fetch GitHub models with raw token:", error.message);
+    return null;
+  }
+}
 
 // Model discovery must identify as the same Codex CLI version as inference.
 const CODEX_MODELS_URL = `https://chatgpt.com/backend-api/codex/models?client_version=${codexProvider.transport.cliVersion}`;
@@ -197,6 +231,16 @@ const PROVIDER_MODELS_CONFIG = {
     authHeader: "x-api-key",
     parseResponse: (data) => data.data || []
   },
+  anthropic: {
+    url: "https://api.anthropic.com/v1/models",
+    method: "GET",
+    headers: {
+      "Anthropic-Version": "2023-06-01",
+      "Content-Type": "application/json"
+    },
+    authHeader: "x-api-key",
+    parseResponse: (data) => data.data || []
+  },
   gemini: {
     url: "https://generativelanguage.googleapis.com/v1beta/models",
     method: "GET",
@@ -221,41 +265,47 @@ const PROVIDER_MODELS_CONFIG = {
     })
   },
   antigravity: {
-    url: "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:models",
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    authHeader: "Authorization",
-    authPrefix: "Bearer ",
-    body: {},
-    parseResponse: (data) => data.models || []
+    // `v1internal:models` is dead upstream (404). Live discovery is
+    // `v1internal:fetchAvailableModels` - same endpoint the quota path uses -
+    // POST with the IDE User-Agent and the user's cloud project id.
+    customResolver: buildOAuthResolver({
+      refreshFn: (conn) => refreshGoogleToken(conn.refreshToken, ANTIGRAVITY_OAUTH_CLIENT.clientId, ANTIGRAVITY_OAUTH_CLIENT.clientSecret),
+      fetchFn: async (token, conn) => {
+        const projectId = conn.projectId || conn.providerSpecificData?.projectId || await getProjectIdForConnection(conn.id, token, "antigravity");
+        return fetch(`${ANTIGRAVITY_IDE_BASE_URL}/v1internal:fetchAvailableModels`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`,
+            "User-Agent": ANTIGRAVITY_IDE_USER_AGENT,
+            "X-Client-Name": "antigravity",
+            "X-Client-Version": ANTIGRAVITY_IDE_VERSION,
+          },
+          body: JSON.stringify(projectId ? { project: projectId } : {}),
+        });
+      },
+      parseFn: parseGeminiCliModels,
+      errorLabel: "Failed to fetch Antigravity models"
+    })
   },
   github: {
-    url: "https://api.githubcopilot.com/models",
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      "Copilot-Integration-Id": "vscode-chat",
-      "editor-version": "vscode/1.107.1",
-      "editor-plugin-version": "copilot-chat/0.26.7",
-      "user-agent": "GitHubCopilotChat/0.26.7"
+      // Copilot /models rejects the exchanged copilot token on some accounts
+      // (402) while the raw GitHub token still works; resolveCopilotModels only
+      // auto-refreshes on 401/403, so fall back to the raw token here.
+      customResolver: async (connection) => {
+        const result = await resolveCopilotModels({
+          accessToken: connection.accessToken,
+          providerSpecificData: connection.providerSpecificData || {},
+        }, { forceRefresh: true, log: console });
+        if (result?.models?.length) return { models: result.models };
+        const raw = connection.accessToken ? await fetchGithubModelsWithRawToken(connection.accessToken) : null;
+        if (raw?.length) return { models: raw };
+        return {
+          models: getStaticProviderModels("github"),
+          warning: "GitHub Copilot returned no live models; falling back to static catalog.",
+        };
+      }
     },
-    authHeader: "Authorization",
-    authPrefix: "Bearer ",
-    parseResponse: (data) => {
-      if (!data?.data) return [];
-      // Filter out embeddings, non-chat models, and disabled models
-      return data.data
-        .filter(m => m.capabilities?.type === "chat")
-        .filter(m => m.policy?.state !== "disabled") // Only return explicitly enabled models
-        .map(m => ({
-          id: m.id,
-          name: m.name || m.id,
-          version: m.version,
-          capabilities: m.capabilities,
-          isDefault: m.model_picker_enabled === true
-        }));
-    }
-  },
   openai: createOpenAIModelsConfig("https://api.openai.com/v1/models"),
   openrouter: createOpenAIModelsConfig("https://openrouter.ai/api/v1/models"),
   nous: {
@@ -283,6 +333,14 @@ const PROVIDER_MODELS_CONFIG = {
   },
   "alicode-intl": {
     url: "https://coding-intl.dashscope.aliyuncs.com/v1/models",
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    authHeader: "Authorization",
+    authPrefix: "Bearer ",
+    parseResponse: (data) => data.data || []
+  },
+  "alitp-intl": {
+    url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/models",
     method: "GET",
     headers: { "Content-Type": "application/json" },
     authHeader: "Authorization",

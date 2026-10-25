@@ -14,6 +14,7 @@ export default function Modal({
   size = "md",
   closeOnOverlay = true,
   showTrafficLights = true,
+  showCloseButton = true,
   className,
 }) {
   const sizes = {
@@ -34,12 +35,13 @@ export default function Modal({
   }, [isOpen]);
 
   useEffect(() => {
+    if (!showCloseButton) return;
     const handleEscape = (e) => {
       if (e.key === "Escape" && isOpen) onClose();
     };
     document.addEventListener("keydown", handleEscape);
     return () => document.removeEventListener("keydown", handleEscape);
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, showCloseButton]);
 
   if (!isOpen) return null;
 
@@ -63,7 +65,7 @@ export default function Modal({
         )}
       >
         {/* Header */}
-        {(title || showTrafficLights) && (
+        {(title || showTrafficLights || showCloseButton) && (
           <div className="flex items-center justify-between p-2 border-b border-border-subtle">
             <div className="flex items-center">
               {/* Traffic lights — desktop only */}
@@ -71,7 +73,8 @@ export default function Modal({
                 <div className="hidden md:flex items-center gap-2 mr-4 ml-2">
                   <Tooltip text="Close" position="top" color="#FF5F56">
                     <button
-                      onClick={onClose}
+                      onClick={showCloseButton ? onClose : undefined}
+                      disabled={!showCloseButton}
                       aria-label="Close"
                       title="Close"
                       className="w-4 h-4 rounded-full bg-[#FF5F56] hover:brightness-90 transition-all cursor-pointer flex items-center justify-center group/dot"
@@ -88,13 +91,15 @@ export default function Modal({
               )}
             </div>
             {/* X button — mobile only */}
-            <button
-              onClick={onClose}
-              aria-label="Close"
-              className="md:hidden p-1.5 rounded-[10px] text-text-muted hover:bg-surface-2 hover:text-text-main transition-colors"
-            >
-              <span className="material-symbols-outlined text-[20px]">close</span>
-            </button>
+            {showCloseButton && (
+              <button
+                onClick={onClose}
+                aria-label="Close"
+                className="md:hidden p-1.5 rounded-[10px] text-text-muted hover:bg-surface-2 hover:text-text-main transition-colors"
+              >
+                <span className="material-symbols-outlined text-[20px]">close</span>
+              </button>
+            )}
           </div>
         )}
 

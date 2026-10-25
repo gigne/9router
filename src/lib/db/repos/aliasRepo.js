@@ -54,6 +54,35 @@ export async function deleteCustomModel({ providerAlias, id, type = "llm" }) {
   await customKv.remove(customKey(providerAlias, id, type));
 }
 
+// Bulk upsert inside a single transaction. Each entry follows addCustomModel's
+// semantics (atomic upsert, dedupe, merge-only for existing). Returns how many
+// were newly inserted vs already present. Invalid entries are skipped.
+export async function bulkAddCustomModels({ models }) {
+  if (!Array.isArray(models) || models.length === 0) return { added: 0, existing: 0 };
+  const db = await getAdapter();
+  let added = 0;
+  let existing = 0;
+  db.transaction(() => {
+    for (const item of models) {
+      const { providerAlias, id, type = "llm", name, caps, transport } = item || {};
+      if (!providerAlias || !id) continue;
+      const k = customKey(providerAlias, id, type);
+      const row = db.get(`SELECT value FROM kv WHERE scope = 'customModels' AND key = ?`, [k]);
+      if (row) {
+        const prev = parseJson(row.value) || {};
+        const next = { ...prev, ...(name ? { name } : {}), ...(caps ? { caps } : {}), ...(transport ? { transport } : {}) };
+        db.run(`UPDATE kv SET value = ? WHERE scope = 'customModels' AND key = ?`, [stringifyJson(next), k]);
+        existing += 1;
+        continue;
+      }
+      const value = stringifyJson({ providerAlias, id, type, name: name || id, ...(caps ? { caps } : {}), ...(transport ? { transport } : {}) });
+      db.run(`INSERT INTO kv(scope, key, value) VALUES('customModels', ?, ?)`, [k, value]);
+      added += 1;
+    }
+  });
+  return { added, existing };
+}
+
 // mitmAlias: key=toolName, value=mappings object
 export async function getMitmAlias(toolName) {
   if (toolName) {

@@ -71,12 +71,13 @@ function CompatibleModelRow({ modelId, fullModel, copied, onCopy, onDeleteAlias,
   );
 }
 
-export default function CompatibleModelsSection({ providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onDeleteCustomModel, connections, isAnthropic }) {
+export default function CompatibleModelsSection({ providerStorageAlias, providerDisplayAlias, modelAliases, customModels, copied, onCopy, onDeleteAlias, onAddCustomModel, onBulkAddCustomModels, onImportWithProgress, onDeleteCustomModel, connections, isAnthropic }) {
   const [newModel, setNewModel] = useState("");
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
   const [testingModelId, setTestingModelId] = useState(null);
   const [modelTestResults, setModelTestResults] = useState({});
+  const [modelFilter, setModelFilter] = useState("");
 
   const handleTestModel = async (modelId) => {
     if (testingModelId) return;
@@ -103,6 +104,13 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
     type: "llm",
   });
 
+  const modelFilterQuery = modelFilter.trim().toLowerCase();
+  const matchesModelFilter = (id, name) =>
+    !modelFilterQuery
+    || id.toLowerCase().includes(modelFilterQuery)
+    || (name && typeof name === "string" && name.toLowerCase().includes(modelFilterQuery));
+  const filteredModels = allModels.filter((m) => matchesModelFilter(m.id, m.name));
+
   const handleAdd = async () => {
     if (!newModel.trim() || adding) return;
     const modelId = newModel.trim();
@@ -123,36 +131,26 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
   };
 
   const handleImport = async () => {
-    if (importing) return;
+    if (importing || !onImportWithProgress) return;
     const activeConnection = connections.find((conn) => conn.isActive !== false);
     if (!activeConnection) return;
 
     setImporting(true);
     try {
-      const res = await fetch(`/api/providers/${activeConnection.id}/models`);
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.error || "Failed to import models");
-        return;
-      }
-      const models = data.models || [];
-      if (models.length === 0) {
-        alert("No models returned from /models.");
-        return;
-      }
-      let importedCount = 0;
-      for (const model of models) {
-        const modelId = model.id || model.name || model.model;
-        if (!modelId) continue;
-        if (allModels.some((entry) => entry.id === modelId)) continue;
-        await onAddCustomModel(modelId);
-        importedCount += 1;
-      }
-      if (importedCount === 0) {
-        alert("No new models were added.");
-      }
-    } catch (error) {
-      console.log("Error importing models:", error);
+      await onImportWithProgress({
+        label: isAnthropic ? "Anthropic" : "compatible",
+        fetchModels: async () => {
+          const res = await fetch(`/api/providers/${activeConnection.id}/models`);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Failed to import models");
+          const models = data.models || [];
+          if (models.length === 0) throw new Error("No models returned from /models.");
+          return models;
+        },
+        buildToAdd: (models) => models
+          .map((model) => model.id || model.name || model.model)
+          .filter((modelId) => modelId && !allModels.some((entry) => entry.id === modelId)),
+      });
     } finally {
       setImporting(false);
     }
@@ -195,7 +193,17 @@ export default function CompatibleModelsSection({ providerStorageAlias, provider
 
       {allModels.length > 0 && (
         <div className="flex flex-col gap-3">
-          {allModels.map(({ id, alias, source }) => (
+          <div className="flex items-center gap-2">
+            <span className="material-symbols-outlined text-sm text-text-muted">search</span>
+            <input
+              type="search"
+              value={modelFilter}
+              onChange={(e) => setModelFilter(e.target.value)}
+              placeholder="Filter models…"
+              className="w-full max-w-xs rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus:outline-none"
+            />
+          </div>
+          {filteredModels.map(({ id, alias, source }) => (
             <CompatibleModelRow
               key={`${source}-${providerStorageAlias}/${id}`}
               modelId={id}
@@ -223,6 +231,7 @@ CompatibleModelsSection.propTypes = {
   onCopy: PropTypes.func.isRequired,
   onDeleteAlias: PropTypes.func.isRequired,
   onAddCustomModel: PropTypes.func.isRequired,
+  onBulkAddCustomModels: PropTypes.func.isRequired,
   onDeleteCustomModel: PropTypes.func.isRequired,
   connections: PropTypes.arrayOf(PropTypes.shape({
     id: PropTypes.string,

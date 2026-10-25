@@ -27,6 +27,7 @@ import CustomConfigCard from "./CustomConfigCard";
 import AutoPingScheduleModal from "./AutoPingScheduleModal";
 import WebLoginButton, { WEB_LOGIN_PROVIDERS } from "../components/WebLoginButton.js";
 import { getScheduleSlotLabels } from "@/shared/services/quotaPingSchedule";
+import ImportProgressModal from "./ImportProgressModal";
 
 const ONE_BY_ONE_DELAY_MS = 1000;
 
@@ -34,6 +35,49 @@ const AUTO_PING_SETTINGS_KEYS = {
   claude: "claudeAutoPing",
   codex: "codexAutoPing",
 };
+
+const PROVIDERS_WITH_MODEL_LIST_ENDPOINT = new Set([
+  "agnes",
+  "alicode",
+  "alicode-intl",
+  "alims-intl",
+  "alitp-intl",
+  "anthropic",
+  "antigravity",
+  "atria",
+  "bai",
+  "byteplus",
+  "cerebras",
+  "chutes",
+  "claude",
+  "cohere",
+  "dahl",
+  "deepseek",
+  "fireworks",
+  "gemini",
+  "gemini-cli",
+  "github",
+  "groq",
+  "hyperbolic",
+  "kimchi",
+  "kiro",
+  "mistral",
+  "muse",
+  "nebius",
+  "nvidia",
+  "ollama",
+  "ollama-local",
+  "openai",
+  "openrouter",
+  "perplexity",
+  "perplexity-agent",
+  "siliconflow",
+  "together",
+  "tokenharbor",
+  "vercel-ai-gateway",
+  "volcengine-ark",
+  "xai",
+]);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -72,6 +116,7 @@ export default function ProviderDetailPage() {
   const [providerStrategy, setProviderStrategy] = useState(null);
   const [providerStickyLimit, setProviderStickyLimit] = useState("");
   const [thinkingMode, setThinkingMode] = useState("auto");
+  const [modelFilter, setModelFilter] = useState("");
   const [autoPing, setAutoPing] = useState({ enabled: false, connections: {}, schedules: {} });
   const [scheduleConnection, setScheduleConnection] = useState(null);
   const [suggestedModels, setSuggestedModels] = useState([]);
@@ -90,6 +135,8 @@ export default function ProviderDetailPage() {
   const stopOneByOneRef = useRef(false);
   const [importingQoderModels, setImportingQoderModels] = useState(false);
   const [importingClineModels, setImportingClineModels] = useState(false);
+  const [importingModels, setImportingModels] = useState(false);
+  const [importProgress, setImportProgress] = useState(null);
   const { copied, copy } = useCopyToClipboard();
 
   const AG_RISK_STORAGE_KEY = "ag_risk_confirmed";
@@ -573,12 +620,83 @@ export default function ProviderDetailPage() {
       if (res.ok) {
         await fetchCustomModels();
         if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("customModelChanged"));
+        return true;
       } else {
         const data = await res.json();
         alert(data.error || "Failed to add custom model");
       }
     } catch (error) {
       console.log("Error adding custom model:", error);
+    }
+    return false;
+  };
+
+    // Add many custom models for one provider in a single bulk request.
+    // Returns the number of newly imported models.
+    const handleBulkAddCustomModels = async (modelIds, providerAliasOverride = providerStorageAlias) => {
+      if (!modelIds.length) return 0;
+      const res = await fetch("/api/models/custom/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ models: modelIds.map((id) => ({ providerAlias: providerAliasOverride, id, type: "llm" })) }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || "Failed to bulk add custom models");
+      }
+      const data = await res.json();
+      await fetchCustomModels();
+      if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("customModelChanged"));
+      return data.added || 0;
+    };
+
+  // Drives the shared import-progress modal: fetching -> importing -> done/error.
+  // fetchModels() must return the model list; buildToAdd() returns the ids to import.
+  const runImportWithProgress = async ({ label, fetchModels, buildToAdd }) => {
+    setImportProgress({
+      phase: "fetching",
+      status: `Fetching ${label} models...`,
+      logs: [`Fetching ${label} models...`],
+    });
+    try {
+      const models = await fetchModels();
+      const toAdd = buildToAdd(models);
+      const skippedCount = models.length - toAdd.length;
+      if (toAdd.length === 0) {
+        setImportProgress({
+          phase: "done",
+          status: "No new models added",
+          logs: skippedCount > 0
+            ? [`Skipped ${skippedCount} already-existing model${skippedCount === 1 ? "" : "s"}`]
+            : ["All models already exist"],
+        });
+        return;
+      }
+      setImportProgress((prev) => ({
+        ...prev,
+        phase: "importing",
+        status: `Adding ${toAdd.length} model${toAdd.length === 1 ? "" : "s"}...`,
+        logs: [...prev.logs, `Adding ${toAdd.length} model${toAdd.length === 1 ? "" : "s"}...`],
+      }));
+      const importedCount = await handleBulkAddCustomModels(toAdd, providerStorageAlias);
+      setImportProgress({
+        phase: "done",
+        status: importedCount > 0
+          ? `Successfully added ${importedCount} model${importedCount === 1 ? "" : "s"}`
+          : "No new models added",
+        logs: [
+          ...(importedCount > 0 ? [`✓ Added ${importedCount} model${importedCount === 1 ? "" : "s"}`] : []),
+          ...(skippedCount > 0 ? [`Skipped ${skippedCount} already-existing model${skippedCount === 1 ? "" : "s"}`] : []),
+        ],
+      });
+    } catch (error) {
+      console.log("Error importing models:", error);
+      setImportProgress({
+        phase: "error",
+        status: "Import failed",
+        error: error.message || "Unknown error",
+        logs: [`✗ ${error.message || "Unknown error"}`],
+      });
     }
   };
 
@@ -600,100 +718,144 @@ export default function ProviderDetailPage() {
     if (importingQoderModels) return;
     const activeConnection = connections.find((conn) => conn.isActive !== false);
     if (!activeConnection) {
-      alert(translate("Please add an active Qoder connection first"));
+      setImportProgress({
+        phase: "error",
+        status: "Import failed",
+        error: "Please add an active Qoder connection first",
+        logs: ["✗ Please add an active Qoder connection first"],
+      });
       return;
     }
 
     setImportingQoderModels(true);
     try {
-      const res = await fetch(`/api/providers/${activeConnection.id}/models`);
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.error || translate("Failed to fetch models"));
-        return;
-      }
-      const models = data.models || [];
-      if (models.length === 0) {
-        alert(translate("No models returned"));
-        return;
-      }
-
-      let importedCount = 0;
-      for (const model of models) {
-        const modelId = model.id || model.name;
-        if (!modelId) continue;
-        
-        // Qoder model ID format may be "qoder/auto", "qoder-cn/auto" or "auto",
-        // need to remove the provider prefix before storing.
-        const cleanModelId = modelId.replace(/^(qoder-cn|qoder)\//, "");
-        const alreadyExists = customModels.some(
-          (entry) => entry.providerAlias === providerStorageAlias && entry.id === cleanModelId && (entry.kind || entry.type || "llm") === "llm"
-        ) || Object.values(modelAliases).includes(`${providerStorageAlias}/${cleanModelId}`);
-        if (alreadyExists) {
-          continue;
-        }
-
-        await handleAddCustomModel(cleanModelId, "llm", providerStorageAlias);
-        importedCount += 1;
-      }
-      
-      if (importedCount === 0) {
-        alert(translate("All models already exist, no new models added"));
-      } else {
-        alert(translate("Successfully added") + ` ${importedCount} ` + translate("models"));
-      }
-    } catch (error) {
-      console.log("Error importing Qoder models:", error);
-      alert(translate("Error fetching models") + ": " + error.message);
+      await runImportWithProgress({
+        label: "Qoder",
+        fetchModels: async () => {
+          const res = await fetch(`/api/providers/${activeConnection.id}/models`);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Failed to fetch models");
+          const models = data.models || [];
+          if (models.length === 0) throw new Error("No models returned");
+          return models;
+        },
+        buildToAdd: (models) => {
+          const toAdd = [];
+          for (const model of models) {
+            const modelId = model.id || model.name;
+            if (!modelId) continue;
+            // Qoder model ID format may be "qoder/auto", "qoder-cn/auto" or "auto",
+            // need to remove the provider prefix before storing.
+            const cleanModelId = modelId.replace(/^(qoder-cn|qoder)\//, "");
+            const alreadyExists = customModels.some(
+              (entry) => entry.providerAlias === providerStorageAlias && entry.id === cleanModelId && (entry.kind || entry.type || "llm") === "llm"
+            ) || Object.values(modelAliases).includes(`${providerStorageAlias}/${cleanModelId}`);
+            if (alreadyExists) continue;
+            toAdd.push(cleanModelId);
+          }
+          return toAdd;
+        },
+      });
     } finally {
       setImportingQoderModels(false);
     }
   };
-  // Fetch the live Cline /models catalog and add every model not yet present.
+
   // Cline and ClinePass share the same catalog endpoint (api.cline.bot/api/v1/models).
   const handleImportClineModels = async () => {
     if (importingClineModels) return;
     const activeConnection = connections.find((conn) => conn.isActive !== false);
     if (!activeConnection) {
-      alert(translate("Please add an active Cline connection first"));
+      setImportProgress({
+        phase: "error",
+        status: "Import failed",
+        error: "Please add an active Cline connection first",
+        logs: ["✗ Please add an active Cline connection first"],
+      });
       return;
     }
+
     setImportingClineModels(true);
     try {
-      const res = await fetch(`/api/providers/${activeConnection.id}/models`);
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.error || translate("Failed to fetch models"));
-        return;
-      }
-      const models = data.models || [];
-      if (models.length === 0) {
-        alert(translate("No models returned"));
-        return;
-      }
-      let importedCount = 0;
-      for (const model of models) {
-        const modelId = model.id || model.name;
-        if (!modelId) continue;
-        const alreadyExists = customModels.some(
-          (entry) => entry.providerAlias === providerStorageAlias && entry.id === modelId && (entry.kind || entry.type || "llm") === "llm"
-        ) || Object.values(modelAliases).includes(`${providerStorageAlias}/${modelId}`);
-        if (alreadyExists) {
-          continue;
-        }
-        await handleAddCustomModel(modelId, "llm", providerStorageAlias);
-        importedCount += 1;
-      }
-      if (importedCount === 0) {
-        alert(translate("All models already exist, no new models added"));
-      } else {
-        alert(translate("Successfully added") + ` ${importedCount} ` + translate("models"));
-      }
-    } catch (error) {
-      console.log("Error importing Cline models:", error);
-      alert(translate("Error fetching models") + ": " + error.message);
+      await runImportWithProgress({
+        label: "Cline",
+        fetchModels: async () => {
+          const res = await fetch(`/api/providers/${activeConnection.id}/models`);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Failed to fetch models");
+          const models = data.models || [];
+          if (models.length === 0) throw new Error("No models returned");
+          return models;
+        },
+        buildToAdd: (models) => {
+          const toAdd = [];
+          for (const model of models) {
+            const modelId = model.id || model.name;
+            if (!modelId) continue;
+            const alreadyExists = customModels.some(
+              (entry) => entry.providerAlias === providerStorageAlias && entry.id === modelId && (entry.kind || entry.type || "llm") === "llm"
+            ) || Object.values(modelAliases).includes(`${providerStorageAlias}/${modelId}`);
+            if (alreadyExists) continue;
+            toAdd.push(modelId);
+          }
+          return toAdd;
+        },
+      });
     } finally {
       setImportingClineModels(false);
+    }
+  };
+
+  const handleImportModels = async () => {
+    if (importingModels) return;
+    const activeConnection = connections.find((conn) => conn.isActive !== false);
+    if (!activeConnection) {
+      setImportProgress({
+        phase: "error",
+        status: "Import failed",
+        error: "Please add an active provider connection first",
+        logs: ["✗ Please add an active provider connection first"],
+      });
+      return;
+    }
+
+    setImportingModels(true);
+    try {
+      await runImportWithProgress({
+        label: "provider",
+        fetchModels: async () => {
+          const res = await fetch(`/api/providers/${activeConnection.id}/models`);
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || "Failed to fetch provider models");
+          const fetchedModels = data.models || [];
+          if (fetchedModels.length === 0) throw new Error("No models returned from the provider model endpoint.");
+          return fetchedModels;
+        },
+        buildToAdd: (fetchedModels) => {
+          const existingIds = new Set([
+            ...models.map((model) => model.id),
+            ...customModels
+              .filter((model) => model.providerAlias === providerStorageAlias)
+              .map((model) => model.id),
+            ...Object.values(modelAliases)
+              .filter((model) => typeof model === "string" && model.startsWith(`${providerStorageAlias}/`))
+              .map((model) => model.slice(providerStorageAlias.length + 1)),
+          ]);
+          const toAdd = [];
+          for (const model of fetchedModels) {
+            let modelId = model.id || model.name || model.model;
+            if (providerId === "gemini" && typeof modelId === "string") {
+              modelId = modelId.replace(/^models\//, "");
+            }
+            if (!modelId || existingIds.has(modelId)) continue;
+            toAdd.push(modelId);
+            existingIds.add(modelId);
+          }
+          return toAdd;
+        },
+      });
+    } finally {
+      setImportingModels(false);
     }
   };
 
@@ -1172,6 +1334,8 @@ export default function ProviderDetailPage() {
           onSetAlias={handleSetAlias}
           onDeleteAlias={handleDeleteAlias}
           onAddCustomModel={(modelId) => handleAddCustomModel(modelId, "llm", providerStorageAlias)}
+          onBulkAddCustomModels={(modelIds) => handleBulkAddCustomModels(modelIds, providerStorageAlias)}
+          onImportWithProgress={runImportWithProgress}
           onDeleteCustomModel={(modelId) => handleDeleteCustomModel(modelId, "llm", providerStorageAlias)}
           connections={connections}
           isAnthropic={isAnthropicCompatible}
@@ -1185,15 +1349,20 @@ export default function ProviderDetailPage() {
       ...kiloFreeModels.filter((fm) => !models.some((m) => m.id === fm.id)),
     ].filter((m) => { const k = getModelKind(m); return !k || k === "llm"; });
     const disabledSet = new Set(disabledModelIds);
-    const displayModels = allModels.filter((m) => !disabledSet.has(m.id));
-    const disabledDisplayModels = allModels.filter((m) => disabledSet.has(m.id));
+    const modelFilterQuery = modelFilter.trim().toLowerCase();
+    const matchesFilter = (id, name) =>
+      !modelFilterQuery
+      || id.toLowerCase().includes(modelFilterQuery)
+      || (name && typeof name === "string" && name.toLowerCase().includes(modelFilterQuery));
+    const displayModels = allModels.filter((m) => !disabledSet.has(m.id) && matchesFilter(m.id, m.name));
+    const disabledDisplayModels = allModels.filter((m) => disabledSet.has(m.id) && matchesFilter(m.id, m.name));
     const customModelRows = getProviderCustomModelRows({
       customModels,
       modelAliases,
       providerAlias: providerStorageAlias,
       builtInModels: models,
       type: "llm",
-    });
+    }).filter((row) => matchesFilter(row.id, row.name));
 
     return (
       <div className="flex flex-wrap gap-3">
@@ -1259,6 +1428,20 @@ export default function ProviderDetailPage() {
           <span className="material-symbols-outlined text-sm">add</span>
           Add Model
         </button>
+
+        {PROVIDERS_WITH_MODEL_LIST_ENDPOINT.has(providerId) &&
+          connections.some((conn) => conn.isActive !== false) && (
+          <button
+            onClick={handleImportModels}
+            disabled={importingModels}
+            className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-blue-500/40 px-3 py-2 text-xs text-blue-600 dark:text-blue-400 transition-colors hover:border-blue-500 hover:bg-blue-500/5 sm:w-auto disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <span className="material-symbols-outlined text-sm" style={importingModels ? { animation: "spin 1s linear infinite" } : undefined}>
+              {importingModels ? "progress_activity" : "download"}
+            </span>
+            {importingModels ? translate("Fetching...") : "Import from /models"}
+          </button>
+        )}
 
         {/* Import Qoder models button — only show for qoder/qoder-cn provider */}
         {(providerId === "qoder" || providerId === "qoder-cn") && connections.some((conn) => conn.isActive !== false) && (
@@ -1806,6 +1989,18 @@ export default function ProviderDetailPage() {
             );
           })()}
         </div>
+        {!isCompatible && (
+          <div className="mb-4 flex items-center gap-2">
+            <span className="material-symbols-outlined text-sm text-text-muted">search</span>
+            <input
+              type="search"
+              value={modelFilter}
+              onChange={(e) => setModelFilter(e.target.value)}
+              placeholder="Filter models…"
+              className="w-full max-w-xs rounded-md border border-border bg-background px-2 py-1 text-xs focus:border-primary focus:outline-none"
+            />
+          </div>
+        )}
         {!!modelsTestError && (
           <div className="mb-3">
             <p className="text-xs text-red-500 break-words">{modelsTestError}</p>
@@ -1991,6 +2186,12 @@ export default function ProviderDetailPage() {
         title={confirmState?.title || "Confirm"}
         message={confirmState?.message}
         variant="danger"
+      />
+
+      <ImportProgressModal
+        isOpen={!!importProgress}
+        onClose={() => setImportProgress(null)}
+        progress={importProgress}
       />
     </div>
   );
